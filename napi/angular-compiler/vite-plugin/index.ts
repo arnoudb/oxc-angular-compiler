@@ -14,7 +14,14 @@ import { ServerResponse } from 'node:http'
 import { dirname, resolve } from 'node:path'
 
 import { createDebug } from 'obug'
-import type { Plugin, ResolvedConfig, ViteDevServer, Connect } from 'vite'
+import type {
+  HtmlTagDescriptor,
+  ModuleNode,
+  Plugin,
+  ResolvedConfig,
+  ViteDevServer,
+  Connect,
+} from 'vite'
 import { preprocessCSS, normalizePath } from 'vite'
 
 // Debug loggers - enable with DEBUG=vite:oxc-angular:*
@@ -44,6 +51,7 @@ import {
   locateTemplateStringFor,
 } from './utils/decorator-fields.js'
 import { injectDtsDeclarations } from './utils/dts.js'
+import { HMR_FULL_RELOAD_GUARD, markModuleSelfAccepting } from './utils/hmr-full-reload-guard.js'
 
 /**
  * Plugin options for the Angular Vite plugin.
@@ -302,6 +310,37 @@ export function angular(options: PluginOptions = {}): Plugin[] {
     }
   }
 
+  // Collect the owning component JS modules for a resource so Vite 8 does
+  // not treat a leftover `.html` change as a page reload (`isClientHtmlChange`
+  // / empty-modules HTML path). Analog marks those modules self-accepting.
+  function collectOwnerJsModules(
+    ctx: { file: string; server: ViteDevServer },
+    resourcePath: string,
+  ): ModuleNode[] {
+    const ownerFiles = new Set<string>()
+    const componentFile = resourceToComponent.get(resourcePath) ?? resourceToComponent.get(ctx.file)
+    if (componentFile) ownerFiles.add(componentFile)
+    for (const owner of styleComponentOwners.get(resourcePath) ?? []) {
+      ownerFiles.add(owner)
+    }
+
+    const seen = new Set<ModuleNode>()
+    const ownerMods: ModuleNode[] = []
+    for (const owner of ownerFiles) {
+      const byId = ctx.server.moduleGraph.getModuleById(owner)
+      if (byId && !seen.has(byId)) {
+        seen.add(byId)
+        ownerMods.push(markModuleSelfAccepting(byId))
+      }
+      for (const mod of ctx.server.moduleGraph.getModulesByFile?.(owner) ?? []) {
+        if (seen.has(mod)) continue
+        seen.add(mod)
+        ownerMods.push(markModuleSelfAccepting(mod))
+      }
+    }
+    return ownerMods
+  }
+
   // Re-read and re-preprocess a style file so its dependency registration in
   // `styleDepsCache`/`styleDepOwners` reflects the current `@use`/`@import`
   // set. Without this, a partial added or switched via HMR would never be
@@ -489,6 +528,20 @@ export function angular(options: PluginOptions = {}): Plugin[] {
       configResolved(config) {
         resolvedConfig = config
       },
+      // Vite 8 full-reloads leftover `.html` updates after Angular HMR
+      // (empty module list, or only non-JS modules). Inject a client
+      // guard that cancels that reload for component templates. See #443.
+      transformIndexHtml(): HtmlTagDescriptor[] | undefined {
+        if (!pluginOptions.liveReload) return
+        return [
+          {
+            tag: 'script',
+            attrs: { type: 'module' },
+            injectTo: 'head',
+            children: HMR_FULL_RELOAD_GUARD,
+          },
+        ]
+      },
       outputOptions(options) {
         outputMinify = options.minify
         return null
@@ -532,9 +585,13 @@ export function angular(options: PluginOptions = {}): Plugin[] {
           'angular:invalidate',
           (data: { id: string; message: string; error: boolean }) => {
             console.warn(`[Angular HMR] Runtime update failed for ${data.id}: ${data.message}`)
+            // Use `/` rather than `*`: the client HTML-HMR guard swallows
+            // leftover Vite reloads with path `*` / `.html` after a
+            // component update (issue #443). A failed runtime update must
+            // still reload the page.
             server.ws.send({
               type: 'full-reload',
-              path: '*',
+              path: '/',
             })
           },
         )
@@ -1022,6 +1079,24 @@ export function angular(options: PluginOptions = {}): Plugin[] {
           // stylesheet that imports the same partial — must keep flowing
           // through Vite's default pipeline; returning [] would drop them and
           // leave that CSS stale.
+          //
+          // Vite 8, however, treats leftover `.html` changes with no JS
+          // modules as a page reload (`isClientHtmlChange` / empty-modules
+          // HTML path). Return the owning component (already self-accepting
+          // via `import.meta.hot.accept`) instead of the HTML module so
+          // Angular HMR is not followed by a full reload. See #443.
+          if (handled && /\.html?$/.test(ctx.file)) {
+            const ownerMods = collectOwnerJsModules(ctx, normalizedFile)
+            if (ownerMods.length > 0) {
+              debugHmr(
+                'html template: returning %d self-accepting owner module(s)',
+                ownerMods.length,
+              )
+              return ownerMods
+            }
+            debugHmr('html template: no owner module in graph, client guard will suppress reload')
+            return []
+          }
           return ctx.modules
         }
 

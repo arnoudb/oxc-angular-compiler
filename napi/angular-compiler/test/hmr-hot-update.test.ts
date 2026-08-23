@@ -613,9 +613,10 @@ describe('handleHotUpdate - Issue #185', () => {
 
     const result = await callHandleHotUpdate(plugin, ctx)
 
-    // Component HMR is dispatched, and Vite's modules are preserved for the
-    // default pipeline.
-    expect(result).toEqual(mockModules)
+    // Component HMR is dispatched. Vite 8 full-reloads leftover `.html`
+    // modules, so we return the owning JS module (none in this mock graph)
+    // rather than the HTML module. See #443.
+    expect(result).toEqual([])
     expect(mockServer._wsMessages).toContainEqual(
       expect.objectContaining({ type: 'custom', event: 'angular:component-update' }),
     )
